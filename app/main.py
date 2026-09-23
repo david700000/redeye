@@ -6,9 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from .routers import scans, scope, ws
 
 app = FastAPI(
-    title="Redshell API",
+    title="Redsense API",
     description=(
-        "Backend for the Redshell pentest workspace. Every scan and "
+        "Backend for the Redsense pentest workspace. Every scan and "
         "exploitation action is checked against an explicit lab scope "
         "before it runs — see /scope."
     ),

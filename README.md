@@ -1,6 +1,6 @@
-# Redshell API
+# Redsense API
 
-FastAPI backend for the Redshell pentest workspace frontend. Runs real
+FastAPI backend for the Redsense pentest workspace frontend. Runs real
 reconnaissance, discovery, and vulnerability detection against
 **scope-authorized targets only** — there is no path to scan or
 exploit anything not explicitly on the scope list.

@@ -17,7 +17,7 @@ CRAWL_MAX_DEPTH = 3
 REQUEST_TIMEOUT_SECONDS = 8.0
 
 # Marker used to detect reflected XSS without needing a real browser.
-XSS_MARKER = "redshellXSSchk9f2"
+XSS_MARKER = "redsenseXSSchk9f2"
 
 # Files we look for during traversal checks. Kept to well-known,
 # non-destructive read targets appropriate for local lab boxes
