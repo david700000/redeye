@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -13,11 +15,14 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Tighten this to your actual frontend origin(s) before anything but
-# local dev touches this.
+# Read allowed origins from env so the Render deployment can be scoped to
+# the real frontend URL via the dashboard, while local dev still works with *.
+_raw_origins = os.environ.get("CORS_ORIGINS", "*")
+ALLOW_ORIGINS = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
