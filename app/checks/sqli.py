@@ -5,21 +5,34 @@ import httpx
 from ..config import REQUEST_TIMEOUT_SECONDS
 from ..crawler import Endpoint
 
-# (true_condition, false_condition) pairs. Tried in order per parameter;
-# first pair that produces a clear true/false divergence is reported.
-PROBE_PAIRS = [
+# ── Append-mode probe pairs ────────────────────────────────────────────────
+# These are APPENDED to the original parameter value, not used as a full
+# replacement. This is critical for real targets where the original value
+# matters (e.g. category=Gifts → Gifts' AND '1'='1 vs Gifts' AND '1'='2).
+APPEND_PROBE_PAIRS = [
+    ("' AND '1'='1", "' AND '1'='2"),          # single-quote string context
+    ("' AND 1=1--", "' AND 1=2--"),             # single-quote + comment
+    ("' AND 1=1#", "' AND 1=2#"),               # MySQL hash comment
+    ('" AND "1"="1', '" AND "1"="2'),            # double-quote string context
+    (" AND 1=1--", " AND 1=2--"),               # unquoted numeric context
+    (" AND 1=1", " AND 1=2"),                   # unquoted numeric (no comment)
+]
+
+# ── Replace-mode probe pairs ───────────────────────────────────────────────
+# Tried when the original value is empty ("") or a plain integer string.
+REPLACE_PROBE_PAIRS = [
     ("1' AND '1'='1", "1' AND '1'='2"),
     ("1 AND 1=1", "1 AND 1=2"),
     ("1\" AND \"1\"=\"1", "1\" AND \"1\"=\"2"),
-    # Numeric-context probes (e.g. WHERE id=1 AND 1=1)
     ("1 AND 1=1--", "1 AND 1=2--"),
     ("1 AND 1=1#", "1 AND 1=2#"),
 ]
 
-# Error-based detection payloads
-ERROR_PAYLOADS = ["'", "\"", "1'", "1\"", "1 OR 1=1--", "1'--"]
+# ── Error-based suffixes ───────────────────────────────────────────────────
+# Appended to original value; trigger a syntax error the DB reports back.
+ERROR_SUFFIXES = ["'", '"', "'--", '"--', "' OR '1'='1", '" OR "1"="1']
 
-# Common SQL error signatures from MySQL, SQLite, PostgreSQL, MSSQL, Oracle, JDBC, DB2
+# ── SQL error signatures ───────────────────────────────────────────────────
 SQL_ERROR_PATTERNS = re.compile(
     r"(you have an error in your sql syntax"
     r"|warning: mysql"
@@ -54,19 +67,19 @@ async def check_sqli(
     headers: dict[str, str] | None = None,
 ) -> list[dict]:
     """
-    Three-pass SQLi heuristic:
+    Three-pass SQLi heuristic (GET params, POST body, cookie values).
 
-    1. Error-based: inject a syntax-breaking payload via GET params, cookie values,
-       and POST body fields, then check response for recognisable DB error strings.
-       Fast and reliable on apps that expose raw errors (testphp.vulnweb.com, DVWA easy,
-       PortSwigger labs with TrackingId cookie).
+    Each pass:
+    1. Error-based  — append a syntax-breaking suffix to the ORIGINAL value
+                      and look for DB error strings in the response.
+    2. Boolean-blind — append true/false conditions to the ORIGINAL value
+                       and compare response lengths to the baseline.
+                       Also tries full-replace probes for empty/numeric params.
 
-    2. Boolean-based blind (GET): send true/false payloads via URL params and compare
-       response lengths.  Works on apps that suppress errors but show different content
-       for matching vs non-matching WHERE clauses.
-
-    3. Boolean-based blind (cookies): same approach, but injected via cookie values.
-       Covers PortSwigger's TrackingId-style labs.
+    Appending to the original value (rather than replacing it) is essential
+    for real targets where the original value matters for query routing, e.g.:
+      category=Gifts  →  Gifts' AND '1'='1   (finds rows)
+                          Gifts' AND '1'='2   (finds none)
     """
     cookies = cookies or {}
     headers = headers or {}
@@ -80,6 +93,7 @@ async def check_sqli(
         headers=headers,
     ) as client:
         for ep in endpoints:
+
             # ── GET query-string params ───────────────────────────────────
             if ep.method == "GET" and ep.params:
                 baseline_len = await _get_baseline(client, ep.url)
@@ -88,10 +102,11 @@ async def check_sqli(
                     key = (ep.path, "get", param)
                     if key in reported:
                         continue
+                    orig = ep.param_values.get(param, "")
 
-                    # Pass 1: error-based via GET param
-                    for err_payload in ERROR_PAYLOADS:
-                        err_url = _build_test_url(ep.url, param, err_payload)
+                    # Pass 1: error-based
+                    for suffix in ERROR_SUFFIXES:
+                        err_url = _build_test_url(ep.url, param, orig + suffix)
                         try:
                             err_resp = await client.get(err_url)
                         except httpx.HTTPError:
@@ -99,22 +114,38 @@ async def check_sqli(
                         if SQL_ERROR_PATTERNS.search(err_resp.text):
                             reported.add(key)
                             findings.append(_make_finding(
-                                ep, param, "GET", err_payload,
-                                "Error-based SQLi: a syntax-breaking payload triggered "
-                                "a recognisable SQL error string in the response body.",
+                                ep, param, "GET",
+                                orig + suffix,
+                                f"The '{param}' parameter is concatenated into a SQL "
+                                "query without sanitization. A syntax-breaking payload "
+                                "triggered a recognisable SQL error string in the response.",
                                 confidence="High",
                             ))
+                            break
+
+                    if key in reported or baseline_len is None:
+                        continue
+
+                    # Pass 2a: boolean-blind — append mode
+                    for true_sfx, false_sfx in APPEND_PROBE_PAIRS:
+                        found = await _boolean_test(
+                            client, ep, param,
+                            orig + true_sfx, orig + false_sfx,
+                            baseline_len, injection="GET",
+                        )
+                        if found:
+                            reported.add(key)
+                            findings.append(found)
                             break
 
                     if key in reported:
                         continue
 
-                    # Pass 2: boolean-based blind via GET param
-                    if baseline_len is None:
-                        continue
-                    for true_p, false_p in PROBE_PAIRS:
+                    # Pass 2b: boolean-blind — replace mode (empty/numeric params)
+                    for true_p, false_p in REPLACE_PROBE_PAIRS:
                         found = await _boolean_test(
-                            client, ep, param, true_p, false_p,
+                            client, ep, param,
+                            true_p, false_p,
                             baseline_len, injection="GET",
                         )
                         if found:
@@ -128,9 +159,10 @@ async def check_sqli(
                     key = (ep.path, "post", param)
                     if key in reported:
                         continue
+                    orig = ep.post_body.get(param, "")
 
-                    for err_payload in ERROR_PAYLOADS:
-                        body = {**ep.post_body, param: err_payload}
+                    for suffix in ERROR_SUFFIXES:
+                        body = {**ep.post_body, param: orig + suffix}
                         try:
                             err_resp = await client.post(ep.url, data=body)
                         except httpx.HTTPError:
@@ -138,10 +170,11 @@ async def check_sqli(
                         if SQL_ERROR_PATTERNS.search(err_resp.text):
                             reported.add(key)
                             findings.append(_make_finding(
-                                ep, param, "POST", err_payload,
-                                "Error-based SQLi via POST body: a syntax-breaking "
-                                "payload in a form field triggered a recognisable "
-                                "SQL error string in the response body.",
+                                ep, param, "POST",
+                                orig + suffix,
+                                f"The '{param}' POST parameter is concatenated into a "
+                                "SQL query. A syntax-breaking payload triggered a "
+                                "recognisable SQL error in the response body.",
                                 confidence="High",
                             ))
                             break
@@ -151,32 +184,47 @@ async def check_sqli(
                 key = (ep.path, "cookie", cookie_name)
                 if key in reported:
                     continue
+                orig = cookies.get(cookie_name, "")
 
-                # Pass 1: error-based via cookie
-                for err_payload in ERROR_PAYLOADS:
-                    injected_cookies = {**cookies, cookie_name: err_payload}
+                # Pass 1: error-based via cookie (append to original value)
+                for suffix in ERROR_SUFFIXES:
+                    injected = {**cookies, cookie_name: orig + suffix}
                     try:
                         err_resp = await client.get(
                             ep.url,
-                            cookies=injected_cookies,  # type: ignore[arg-type]
+                            cookies=injected,  # type: ignore[arg-type]
                         )
                     except httpx.HTTPError:
                         continue
                     if SQL_ERROR_PATTERNS.search(err_resp.text):
                         reported.add(key)
-                        findings.append(_make_finding(
-                            ep, cookie_name, "COOKIE", err_payload,
-                            f"Error-based SQLi via cookie '{cookie_name}': a "
-                            "syntax-breaking payload in the cookie value triggered "
-                            "a recognisable SQL error string in the response.",
-                            confidence="High",
-                        ))
+                        findings.append({
+                            "id": uuid.uuid4().hex[:10],
+                            "category": "sqli",
+                            "severity": "High",
+                            "type": "SQL Injection",
+                            "endpoint": ep.path,
+                            "parameter": cookie_name,
+                            "method": "COOKIE",
+                            "url": ep.url.split("?")[0],
+                            "description": (
+                                f"The '{cookie_name}' cookie value is concatenated "
+                                "into a SQL query without sanitization. A "
+                                "syntax-breaking payload triggered a recognisable "
+                                "SQL error string in the response."
+                            ),
+                            "evidence": (
+                                f"Appending {suffix!r} to the '{cookie_name}' cookie "
+                                "value triggered a recognisable SQL error in the response body."
+                            ),
+                            "confidence": "High",
+                        })
                         break
 
                 if key in reported:
                     continue
 
-                # Pass 2: boolean-based blind via cookie
+                # Pass 2: boolean-blind via cookie (append to original value)
                 try:
                     b1 = await client.get(ep.url)
                     b2 = await client.get(ep.url)
@@ -184,9 +232,9 @@ async def check_sqli(
                 except httpx.HTTPError:
                     continue
 
-                for true_p, false_p in PROBE_PAIRS:
-                    true_cookies = {**cookies, cookie_name: true_p}
-                    false_cookies = {**cookies, cookie_name: false_p}
+                for true_sfx, false_sfx in APPEND_PROBE_PAIRS:
+                    true_cookies = {**cookies, cookie_name: orig + true_sfx}
+                    false_cookies = {**cookies, cookie_name: orig + false_sfx}
                     try:
                         true_resp = await client.get(ep.url, cookies=true_cookies)  # type: ignore[arg-type]
                         false_resp = await client.get(ep.url, cookies=false_cookies)  # type: ignore[arg-type]
@@ -216,9 +264,9 @@ async def check_sqli(
                                 "the backend query is unsanitized."
                             ),
                             "evidence": (
-                                f"Cookie {cookie_name}={true_p!r} matched baseline "
+                                f"Cookie {cookie_name}={orig + true_sfx!r} matched baseline "
                                 f"({tl} bytes, avg {cookie_baseline:.0f}); "
-                                f"{cookie_name}={false_p!r} returned {fl} bytes "
+                                f"{cookie_name}={orig + false_sfx!r} returned {fl} bytes "
                                 f"(delta {abs_diff} bytes)."
                             ),
                             "confidence": "Medium",
@@ -273,10 +321,9 @@ async def _boolean_test(
                 "confirming the backend query is unsanitized."
             ),
             "evidence": (
-                f"{param}={true_payload} matched the baseline response "
-                f"({tl} bytes, avg baseline {baseline_len:.0f} bytes); "
-                f"{param}={false_payload} returned a different response "
-                f"({fl} bytes, delta {abs_diff} bytes)."
+                f"True payload matched baseline ({tl} bytes, avg {baseline_len:.0f}); "
+                f"false payload returned {fl} bytes (delta {abs_diff} bytes). "
+                f"True: {true_payload!r}, False: {false_payload!r}"
             ),
             "confidence": "Medium",
         }

@@ -19,7 +19,11 @@ class Endpoint:
         self.method = method
         parsed = urlparse(url)
         self.path = parsed.path or "/"
-        self.params = list(parse_qs(parsed.query, keep_blank_values=True).keys())
+        parsed_q = parse_qs(parsed.query, keep_blank_values=True)
+        self.params = list(parsed_q.keys())
+        # Original values so checks can append payloads instead of replacing them.
+        # e.g. category=Gifts → {"category": "Gifts"} → inject as "Gifts' AND '1'='1"
+        self.param_values: dict[str, str] = {k: v[0] if v else "" for k, v in parsed_q.items()}
         # For POST endpoints, params holds form field names.
         # cookie_params holds cookie key names to test for injection.
         self.cookie_params: list[str] = []
