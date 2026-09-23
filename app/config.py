@@ -9,7 +9,7 @@ runs. There is no "scan the internet" mode by design.
 # Hosts that are authorized by default. The frontend's Settings > Lab
 # scope screen manages this list at runtime via /scope; this is just
 # the seed value used on startup.
-DEFAULT_LAB_SCOPE = ["localhost", "127.0.0.1"]
+DEFAULT_LAB_SCOPE = ["localhost", "127.0.0.1", "testphp.vulnweb.com"]
 
 # Crawl limits — keep discovery bounded and polite.
 CRAWL_MAX_PAGES = 40
