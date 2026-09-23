@@ -1,4 +1,5 @@
 import uuid
+import re
 import httpx
 
 from ..config import REQUEST_TIMEOUT_SECONDS
@@ -15,29 +16,66 @@ PROBE_PAIRS = [
     ("1' AND '1'='1", "1' AND '1'='2"),
     ("1 AND 1=1", "1 AND 1=2"),
     ("1\" AND \"1\"=\"1", "1\" AND \"1\"=\"2"),
+    # Numeric-context probes (e.g. WHERE id=1 AND 1=1)
+    ("1 AND 1=1--", "1 AND 1=2--"),
+    ("1 AND 1=1#", "1 AND 1=2#"),
 ]
+
+# Error-based detection: if injecting a syntax-breaking payload causes
+# recognisable DB error strings to appear, that's also a clear SQLi signal.
+ERROR_PAYLOADS = ["'", "\"", "1'", "1\"", "1 OR 1=1--", "1'--"]
+
+# Common SQL error signatures from MySQL, SQLite, PostgreSQL, MSSQL, Oracle
+SQL_ERROR_PATTERNS = re.compile(
+    r"(you have an error in your sql syntax"
+    r"|warning: mysql"
+    r"|mysql_fetch"
+    r"|pg_query\(\)"
+    r"|supplied argument is not a valid mysql"
+    r"|sqlite_exception"
+    r"|sqlite error"
+    r"|unclosed quotation mark"
+    r"|quoted string not properly terminated"
+    r"|ora-\d{5}"
+    r"|microsoft jet database"
+    r"|microsoft ole db"
+    r"|odbc sql server driver"
+    r"|odbc driver"
+    r"|syntax error.*sql"
+    r"|sql syntax.*error"
+    r"|division by zero"
+    r"|invalid query"
+    r"|unterminated string literal"
+    r"|psql.*error"
+    r"|db2 sql error"
+    r"|com\.mysql\.jdbc"
+    r"|java\.sql\.sqlexception)",
+    re.IGNORECASE,
+)
 
 
 async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
     """
-    Boolean-based blind SQLi heuristic: for each parameter, send a
-    'true' and a 'false' conditional payload and compare response
-    length/status to the baseline. A parameter that's just treated as
-    inert text will respond the same way to both; one that reaches a
-    real SQL WHERE clause typically won't.
+    Two-pass SQLi heuristic:
 
-    Two baseline samples are averaged to dampen page-level noise
-    (dynamic timestamps, CSRF tokens, session data, etc.) that caused
-    single-sample comparisons to be flaky across repeated scans.
+    1. Error-based: inject a quote/syntax-breaking payload and check if the
+       response body contains recognisable DB error strings. Fast and reliable
+       on unparameterised apps (testphp.vulnweb.com, DVWA easy mode).
 
+    2. Boolean-based blind: send a 'true' and a 'false' conditional payload
+       and compare response length/status to the baseline. Works on apps that
+       suppress DB errors but still return different content for matching vs
+       non-matching WHERE clauses.
+
+    Two baseline samples are averaged to dampen per-request noise.
     Divergence is flagged only when BOTH a ratio threshold AND a minimum
-    absolute byte difference are exceeded, preventing false positives on
-    large pages where a small fluctuation could cross the ratio threshold.
+    absolute byte difference are exceeded.
 
     This is intentionally simple — good for CTF/lab-grade apps, not a
     replacement for sqlmap on a hardened target.
     """
     findings = []
+    reported_params: set[tuple[str, str]] = set()
 
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True
@@ -55,6 +93,50 @@ async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
             baseline_len = (len(b1.text) + len(b2.text)) / 2
 
             for param in ep.params:
+                if (ep.path, param) in reported_params:
+                    continue
+
+                # ── Pass 1: Error-based ─────────────────────────────────────
+                for err_payload in ERROR_PAYLOADS:
+                    err_url = _build_test_url(ep.url, param, err_payload)
+                    try:
+                        err_resp = await client.get(err_url)
+                    except httpx.HTTPError:
+                        continue
+
+                    if SQL_ERROR_PATTERNS.search(err_resp.text):
+                        reported_params.add((ep.path, param))
+                        findings.append(
+                            {
+                                "id": uuid.uuid4().hex[:10],
+                                "category": "sqli",
+                                "severity": "High",
+                                "type": "SQL Injection",
+                                "endpoint": ep.path,
+                                "parameter": param,
+                                "method": "GET",
+                                "url": f"{ep.url.split('?')[0]}?{param}=",
+                                "description": (
+                                    f"The '{param}' parameter is concatenated "
+                                    "directly into a SQL query. A syntax-breaking "
+                                    "payload triggered a database error message in "
+                                    "the response, confirming the input reaches an "
+                                    "unsanitised SQL statement."
+                                ),
+                                "evidence": (
+                                    f"Payload {err_payload!r} via '{param}' "
+                                    "triggered a recognisable SQL error string in "
+                                    "the response body."
+                                ),
+                                "confidence": "High",
+                            }
+                        )
+                        break  # error found for this param, skip boolean pass
+
+                if (ep.path, param) in reported_params:
+                    continue  # already reported via error-based
+
+                # ── Pass 2: Boolean-based blind ─────────────────────────────
                 for true_payload, false_payload in PROBE_PAIRS:
                     true_url = _build_test_url(ep.url, param, true_payload)
                     false_url = _build_test_url(ep.url, param, false_payload)
@@ -79,6 +161,7 @@ async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
                     diverges_from_true = ratio_diverges and abs_diff >= 5
 
                     if true_close_to_baseline and diverges_from_true:
+                        reported_params.add((ep.path, param))
                         findings.append(
                             {
                                 "id": uuid.uuid4().hex[:10],
@@ -108,6 +191,7 @@ async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
                             }
                         )
                         break  # one confirmed pair is enough for this param
+
     return findings
 
 
