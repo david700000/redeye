@@ -65,7 +65,7 @@ def _build_test_url(url: str, param: str, payload: str) -> str:
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
     parsed = urlparse(url)
-    query = parse_qs(parsed.query)
+    query = parse_qs(parsed.query, keep_blank_values=True)
     query[param] = [payload]
     new_query = urlencode(query, doseq=True)
     return urlunparse(parsed._replace(query=new_query))

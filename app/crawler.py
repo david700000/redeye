@@ -19,7 +19,7 @@ class Endpoint:
         self.method = method
         parsed = urlparse(url)
         self.path = parsed.path or "/"
-        self.params = list(parse_qs(parsed.query).keys())
+        self.params = list(parse_qs(parsed.query, keep_blank_values=True).keys())
 
     def __repr__(self):
         return f"<Endpoint {self.method} {self.path} params={self.params}>"

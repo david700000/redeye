@@ -76,7 +76,7 @@ async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
                     # both ratio AND a minimum absolute byte floor must be met.
                     abs_diff = abs(false_len - true_len)
                     ratio_diverges = not _within(false_len, true_len, 0.05)
-                    diverges_from_true = ratio_diverges and abs_diff >= 20
+                    diverges_from_true = ratio_diverges and abs_diff >= 5
 
                     if true_close_to_baseline and diverges_from_true:
                         findings.append(
@@ -121,7 +121,7 @@ def _build_test_url(url: str, param: str, payload: str) -> str:
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
     parsed = urlparse(url)
-    query = parse_qs(parsed.query)
+    query = parse_qs(parsed.query, keep_blank_values=True)
     query[param] = [payload]
     new_query = urlencode(query, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
