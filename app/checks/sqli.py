@@ -67,19 +67,16 @@ async def check_sqli(
     headers: dict[str, str] | None = None,
 ) -> list[dict]:
     """
-    Three-pass SQLi heuristic (GET params, POST body, cookie values).
+    Universal SQLi heuristic (GET params, POST body, cookie values).
 
-    Each pass:
-    1. Error-based  — append a syntax-breaking suffix to the ORIGINAL value
-                      and look for DB error strings in the response.
-    2. Boolean-blind — append true/false conditions to the ORIGINAL value
+    For every parameter across all input methods (GET, POST, COOKIES),
+    it runs three passes:
+    1. Error-based   — append a syntax-breaking suffix to the ORIGINAL value
+                       and look for DB error strings in the response.
+    2. Boolean append  — append true/false conditions to the ORIGINAL value
                        and compare response lengths to the baseline.
-                       Also tries full-replace probes for empty/numeric params.
-
-    Appending to the original value (rather than replacing it) is essential
-    for real targets where the original value matters for query routing, e.g.:
-      category=Gifts  →  Gifts' AND '1'='1   (finds rows)
-                          Gifts' AND '1'='2   (finds none)
+    3. Boolean replace — replace the value entirely with true/false payloads
+                       and compare response lengths to the baseline.
     """
     cookies = cookies or {}
     headers = headers or {}
@@ -141,7 +138,7 @@ async def check_sqli(
                     if key in reported:
                         continue
 
-                    # Pass 2b: boolean-blind — replace mode (empty/numeric params)
+                    # Pass 2b: boolean-blind — replace mode
                     for true_p, false_p in REPLACE_PROBE_PAIRS:
                         found = await _boolean_test(
                             client, ep, param,
@@ -155,12 +152,15 @@ async def check_sqli(
 
             # ── POST body params ──────────────────────────────────────────
             if ep.method == "POST" and ep.params:
+                baseline_len = await _post_baseline(client, ep.url, ep.post_body)
+                
                 for param in ep.params:
                     key = (ep.path, "post", param)
                     if key in reported:
                         continue
                     orig = ep.post_body.get(param, "")
 
+                    # Pass 1: error-based
                     for suffix in ERROR_SUFFIXES:
                         body = {**ep.post_body, param: orig + suffix}
                         try:
@@ -178,6 +178,37 @@ async def check_sqli(
                                 confidence="High",
                             ))
                             break
+                            
+                    if key in reported or baseline_len is None:
+                        continue
+                        
+                    # Pass 2a: boolean-blind — append mode
+                    for true_sfx, false_sfx in APPEND_PROBE_PAIRS:
+                        found = await _boolean_post_test(
+                            client, ep, param,
+                            orig + true_sfx, orig + false_sfx,
+                            baseline_len,
+                        )
+                        if found:
+                            reported.add(key)
+                            findings.append(found)
+                            break
+
+                    if key in reported:
+                        continue
+
+                    # Pass 2b: boolean-blind — replace mode
+                    for true_p, false_p in REPLACE_PROBE_PAIRS:
+                        found = await _boolean_post_test(
+                            client, ep, param,
+                            true_p, false_p,
+                            baseline_len,
+                        )
+                        if found:
+                            reported.add(key)
+                            findings.append(found)
+                            break
+
 
             # ── Cookie params ─────────────────────────────────────────────
             for cookie_name in ep.cookie_params:
@@ -185,6 +216,7 @@ async def check_sqli(
                 if key in reported:
                     continue
                 orig = cookies.get(cookie_name, "")
+                baseline_len = await _get_baseline(client, ep.url)
 
                 # Pass 1: error-based via cookie (append to original value)
                 for suffix in ERROR_SUFFIXES:
@@ -221,56 +253,34 @@ async def check_sqli(
                         })
                         break
 
+                if key in reported or baseline_len is None:
+                    continue
+
+                # Pass 2a: boolean-blind via cookie (append to original value)
+                for true_sfx, false_sfx in APPEND_PROBE_PAIRS:
+                    found = await _boolean_cookie_test(
+                        client, ep, cookie_name, cookies,
+                        orig + true_sfx, orig + false_sfx,
+                        baseline_len
+                    )
+                    if found:
+                        reported.add(key)
+                        findings.append(found)
+                        break
+                        
                 if key in reported:
                     continue
-
-                # Pass 2: boolean-blind via cookie (append to original value)
-                try:
-                    b1 = await client.get(ep.url)
-                    b2 = await client.get(ep.url)
-                    cookie_baseline = (len(b1.text) + len(b2.text)) / 2
-                except httpx.HTTPError:
-                    continue
-
-                for true_sfx, false_sfx in APPEND_PROBE_PAIRS:
-                    true_cookies = {**cookies, cookie_name: orig + true_sfx}
-                    false_cookies = {**cookies, cookie_name: orig + false_sfx}
-                    try:
-                        true_resp = await client.get(ep.url, cookies=true_cookies)  # type: ignore[arg-type]
-                        false_resp = await client.get(ep.url, cookies=false_cookies)  # type: ignore[arg-type]
-                    except httpx.HTTPError:
-                        continue
-                    tl, fl = len(true_resp.text), len(false_resp.text)
-                    abs_diff = abs(fl - tl)
-                    if (
-                        _within(tl, cookie_baseline, 0.10)
-                        and not _within(fl, tl, 0.05)
-                        and abs_diff >= 5
-                    ):
+                    
+                # Pass 2b: boolean-blind via cookie (replace mode)
+                for true_p, false_p in REPLACE_PROBE_PAIRS:
+                    found = await _boolean_cookie_test(
+                        client, ep, cookie_name, cookies,
+                        true_p, false_p,
+                        baseline_len
+                    )
+                    if found:
                         reported.add(key)
-                        findings.append({
-                            "id": uuid.uuid4().hex[:10],
-                            "category": "sqli",
-                            "severity": "High",
-                            "type": "SQL Injection",
-                            "endpoint": ep.path,
-                            "parameter": cookie_name,
-                            "method": "COOKIE",
-                            "url": ep.url.split("?")[0],
-                            "description": (
-                                f"The '{cookie_name}' cookie value is concatenated "
-                                "directly into a SQL query. A boolean-based blind "
-                                "injection payload altered the response, confirming "
-                                "the backend query is unsanitized."
-                            ),
-                            "evidence": (
-                                f"Cookie {cookie_name}={orig + true_sfx!r} matched baseline "
-                                f"({tl} bytes, avg {cookie_baseline:.0f}); "
-                                f"{cookie_name}={orig + false_sfx!r} returned {fl} bytes "
-                                f"(delta {abs_diff} bytes)."
-                            ),
-                            "confidence": "Medium",
-                        })
+                        findings.append(found)
                         break
 
     return findings
@@ -285,7 +295,14 @@ async def _get_baseline(client: httpx.AsyncClient, url: str) -> float | None:
         return (len(b1.text) + len(b2.text)) / 2
     except httpx.HTTPError:
         return None
-
+        
+async def _post_baseline(client: httpx.AsyncClient, url: str, body: dict) -> float | None:
+    try:
+        b1 = await client.post(url, data=body)
+        b2 = await client.post(url, data=body)
+        return (len(b1.text) + len(b2.text)) / 2
+    except httpx.HTTPError:
+        return None
 
 async def _boolean_test(
     client: httpx.AsyncClient,
@@ -329,6 +346,84 @@ async def _boolean_test(
         }
     return None
 
+async def _boolean_post_test(
+    client: httpx.AsyncClient,
+    ep: Endpoint,
+    param: str,
+    true_payload: str,
+    false_payload: str,
+    baseline_len: float,
+) -> dict | None:
+    try:
+        true_resp = await client.post(ep.url, data={**ep.post_body, param: true_payload})
+        false_resp = await client.post(ep.url, data={**ep.post_body, param: false_payload})
+    except httpx.HTTPError:
+        return None
+    tl, fl = len(true_resp.text), len(false_resp.text)
+    abs_diff = abs(fl - tl)
+    if _within(tl, baseline_len, 0.10) and not _within(fl, tl, 0.05) and abs_diff >= 5:
+        return {
+            "id": uuid.uuid4().hex[:10],
+            "category": "sqli",
+            "severity": "High",
+            "type": "SQL Injection",
+            "endpoint": ep.path,
+            "parameter": param,
+            "method": "POST",
+            "url": ep.url.split("?")[0],
+            "description": (
+                f"The '{param}' POST parameter is concatenated directly into a SQL query. "
+                "A boolean-based blind injection payload altered the response, "
+                "confirming the backend query is unsanitized."
+            ),
+            "evidence": (
+                f"True payload matched baseline ({tl} bytes, avg {baseline_len:.0f}); "
+                f"false payload returned {fl} bytes (delta {abs_diff} bytes). "
+                f"True: {true_payload!r}, False: {false_payload!r}"
+            ),
+            "confidence": "Medium",
+        }
+    return None
+
+async def _boolean_cookie_test(
+    client: httpx.AsyncClient,
+    ep: Endpoint,
+    param: str,
+    cookies: dict,
+    true_payload: str,
+    false_payload: str,
+    baseline_len: float,
+) -> dict | None:
+    try:
+        true_resp = await client.get(ep.url, cookies={**cookies, param: true_payload})
+        false_resp = await client.get(ep.url, cookies={**cookies, param: false_payload})
+    except httpx.HTTPError:
+        return None
+    tl, fl = len(true_resp.text), len(false_resp.text)
+    abs_diff = abs(fl - tl)
+    if _within(tl, baseline_len, 0.10) and not _within(fl, tl, 0.05) and abs_diff >= 5:
+        return {
+            "id": uuid.uuid4().hex[:10],
+            "category": "sqli",
+            "severity": "High",
+            "type": "SQL Injection",
+            "endpoint": ep.path,
+            "parameter": param,
+            "method": "COOKIE",
+            "url": ep.url.split("?")[0],
+            "description": (
+                f"The '{param}' cookie is concatenated directly into a SQL query. "
+                "A boolean-based blind injection payload altered the response, "
+                "confirming the backend query is unsanitized."
+            ),
+            "evidence": (
+                f"True payload matched baseline ({tl} bytes, avg {baseline_len:.0f}); "
+                f"false payload returned {fl} bytes (delta {abs_diff} bytes). "
+                f"True: {true_payload!r}, False: {false_payload!r}"
+            ),
+            "confidence": "Medium",
+        }
+    return None
 
 def _make_finding(
     ep: Endpoint,
