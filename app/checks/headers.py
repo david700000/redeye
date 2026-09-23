@@ -4,10 +4,19 @@ import httpx
 from ..config import REQUIRED_HEADERS, REQUEST_TIMEOUT_SECONDS
 
 
-async def check_headers(target: str) -> list[dict]:
+async def check_headers(
+    target: str,
+    cookies: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> list[dict]:
+    cookies = cookies or {}
+    headers = headers or {}
     findings = []
     async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        cookies=cookies,
+        headers=headers,
     ) as client:
         try:
             resp = await client.get(target)

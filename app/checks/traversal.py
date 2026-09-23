@@ -9,11 +9,20 @@ from ..crawler import Endpoint
 FILE_LIKE_PARAM_HINTS = ["file", "path", "page", "doc", "template", "include", "dir"]
 
 
-async def check_traversal(endpoints: list[Endpoint]) -> list[dict]:
+async def check_traversal(
+    endpoints: list[Endpoint],
+    cookies: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> list[dict]:
+    cookies = cookies or {}
+    headers = headers or {}
     findings = []
 
     async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        cookies=cookies,
+        headers=headers,
     ) as client:
         for ep in endpoints:
             if ep.method != "GET" or not ep.params:

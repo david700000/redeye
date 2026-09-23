@@ -22,7 +22,15 @@ async def start_scan(req: ScanRequest):
         )
 
     scan = store.create_scan(req.target, req.profile.value)
-    asyncio.create_task(run_scan(scan["id"], req.target, req.profile.value))
+    asyncio.create_task(
+        run_scan(
+            scan["id"],
+            req.target,
+            req.profile.value,
+            cookies=req.cookies or {},
+            headers=req.headers or {},
+        )
+    )
     return scan
 
 

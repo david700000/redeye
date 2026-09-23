@@ -7,11 +7,6 @@ from ..crawler import Endpoint
 
 # (true_condition, false_condition) pairs. Tried in order per parameter;
 # first pair that produces a clear true/false divergence is reported.
-# Each pair leads with a plausible real value (1 / a) so the payload
-# still resolves to a valid row before the boolean condition is
-# ANDed on — a bare "' AND '1'='1" only works if the app happens to
-# treat an empty match as equivalent to the original value, which
-# most apps don't.
 PROBE_PAIRS = [
     ("1' AND '1'='1", "1' AND '1'='2"),
     ("1 AND 1=1", "1 AND 1=2"),
@@ -21,11 +16,10 @@ PROBE_PAIRS = [
     ("1 AND 1=1#", "1 AND 1=2#"),
 ]
 
-# Error-based detection: if injecting a syntax-breaking payload causes
-# recognisable DB error strings to appear, that's also a clear SQLi signal.
+# Error-based detection payloads
 ERROR_PAYLOADS = ["'", "\"", "1'", "1\"", "1 OR 1=1--", "1'--"]
 
-# Common SQL error signatures from MySQL, SQLite, PostgreSQL, MSSQL, Oracle
+# Common SQL error signatures from MySQL, SQLite, PostgreSQL, MSSQL, Oracle, JDBC, DB2
 SQL_ERROR_PATTERNS = re.compile(
     r"(you have an error in your sql syntax"
     r"|warning: mysql"
@@ -54,145 +48,262 @@ SQL_ERROR_PATTERNS = re.compile(
 )
 
 
-async def check_sqli(endpoints: list[Endpoint]) -> list[dict]:
+async def check_sqli(
+    endpoints: list[Endpoint],
+    cookies: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> list[dict]:
     """
-    Two-pass SQLi heuristic:
+    Three-pass SQLi heuristic:
 
-    1. Error-based: inject a quote/syntax-breaking payload and check if the
-       response body contains recognisable DB error strings. Fast and reliable
-       on unparameterised apps (testphp.vulnweb.com, DVWA easy mode).
+    1. Error-based: inject a syntax-breaking payload via GET params, cookie values,
+       and POST body fields, then check response for recognisable DB error strings.
+       Fast and reliable on apps that expose raw errors (testphp.vulnweb.com, DVWA easy,
+       PortSwigger labs with TrackingId cookie).
 
-    2. Boolean-based blind: send a 'true' and a 'false' conditional payload
-       and compare response length/status to the baseline. Works on apps that
-       suppress DB errors but still return different content for matching vs
-       non-matching WHERE clauses.
+    2. Boolean-based blind (GET): send true/false payloads via URL params and compare
+       response lengths.  Works on apps that suppress errors but show different content
+       for matching vs non-matching WHERE clauses.
 
-    Two baseline samples are averaged to dampen per-request noise.
-    Divergence is flagged only when BOTH a ratio threshold AND a minimum
-    absolute byte difference are exceeded.
-
-    This is intentionally simple — good for CTF/lab-grade apps, not a
-    replacement for sqlmap on a hardened target.
+    3. Boolean-based blind (cookies): same approach, but injected via cookie values.
+       Covers PortSwigger's TrackingId-style labs.
     """
+    cookies = cookies or {}
+    headers = headers or {}
     findings = []
-    reported_params: set[tuple[str, str]] = set()
+    reported: set[tuple[str, str, str]] = set()  # (path, injection_type, param)
 
     async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        cookies=cookies,
+        headers=headers,
     ) as client:
         for ep in endpoints:
-            if ep.method != "GET" or not ep.params:
-                continue
+            # ── GET query-string params ───────────────────────────────────
+            if ep.method == "GET" and ep.params:
+                baseline_len = await _get_baseline(client, ep.url)
 
-            # Dual baseline: average two fetches to reduce per-request noise.
-            try:
-                b1 = await client.get(ep.url)
-                b2 = await client.get(ep.url)
-            except httpx.HTTPError:
-                continue
-            baseline_len = (len(b1.text) + len(b2.text)) / 2
+                for param in ep.params:
+                    key = (ep.path, "get", param)
+                    if key in reported:
+                        continue
 
-            for param in ep.params:
-                if (ep.path, param) in reported_params:
+                    # Pass 1: error-based via GET param
+                    for err_payload in ERROR_PAYLOADS:
+                        err_url = _build_test_url(ep.url, param, err_payload)
+                        try:
+                            err_resp = await client.get(err_url)
+                        except httpx.HTTPError:
+                            continue
+                        if SQL_ERROR_PATTERNS.search(err_resp.text):
+                            reported.add(key)
+                            findings.append(_make_finding(
+                                ep, param, "GET", err_payload,
+                                "Error-based SQLi: a syntax-breaking payload triggered "
+                                "a recognisable SQL error string in the response body.",
+                                confidence="High",
+                            ))
+                            break
+
+                    if key in reported:
+                        continue
+
+                    # Pass 2: boolean-based blind via GET param
+                    if baseline_len is None:
+                        continue
+                    for true_p, false_p in PROBE_PAIRS:
+                        found = await _boolean_test(
+                            client, ep, param, true_p, false_p,
+                            baseline_len, injection="GET",
+                        )
+                        if found:
+                            reported.add(key)
+                            findings.append(found)
+                            break
+
+            # ── POST body params ──────────────────────────────────────────
+            if ep.method == "POST" and ep.params:
+                for param in ep.params:
+                    key = (ep.path, "post", param)
+                    if key in reported:
+                        continue
+
+                    for err_payload in ERROR_PAYLOADS:
+                        body = {**ep.post_body, param: err_payload}
+                        try:
+                            err_resp = await client.post(ep.url, data=body)
+                        except httpx.HTTPError:
+                            continue
+                        if SQL_ERROR_PATTERNS.search(err_resp.text):
+                            reported.add(key)
+                            findings.append(_make_finding(
+                                ep, param, "POST", err_payload,
+                                "Error-based SQLi via POST body: a syntax-breaking "
+                                "payload in a form field triggered a recognisable "
+                                "SQL error string in the response body.",
+                                confidence="High",
+                            ))
+                            break
+
+            # ── Cookie params ─────────────────────────────────────────────
+            for cookie_name in ep.cookie_params:
+                key = (ep.path, "cookie", cookie_name)
+                if key in reported:
                     continue
 
-                # ── Pass 1: Error-based ─────────────────────────────────────
+                # Pass 1: error-based via cookie
                 for err_payload in ERROR_PAYLOADS:
-                    err_url = _build_test_url(ep.url, param, err_payload)
+                    injected_cookies = {**cookies, cookie_name: err_payload}
                     try:
-                        err_resp = await client.get(err_url)
+                        err_resp = await client.get(
+                            ep.url,
+                            cookies=injected_cookies,  # type: ignore[arg-type]
+                        )
                     except httpx.HTTPError:
                         continue
-
                     if SQL_ERROR_PATTERNS.search(err_resp.text):
-                        reported_params.add((ep.path, param))
-                        findings.append(
-                            {
-                                "id": uuid.uuid4().hex[:10],
-                                "category": "sqli",
-                                "severity": "High",
-                                "type": "SQL Injection",
-                                "endpoint": ep.path,
-                                "parameter": param,
-                                "method": "GET",
-                                "url": f"{ep.url.split('?')[0]}?{param}=",
-                                "description": (
-                                    f"The '{param}' parameter is concatenated "
-                                    "directly into a SQL query. A syntax-breaking "
-                                    "payload triggered a database error message in "
-                                    "the response, confirming the input reaches an "
-                                    "unsanitised SQL statement."
-                                ),
-                                "evidence": (
-                                    f"Payload {err_payload!r} via '{param}' "
-                                    "triggered a recognisable SQL error string in "
-                                    "the response body."
-                                ),
-                                "confidence": "High",
-                            }
-                        )
-                        break  # error found for this param, skip boolean pass
+                        reported.add(key)
+                        findings.append(_make_finding(
+                            ep, cookie_name, "COOKIE", err_payload,
+                            f"Error-based SQLi via cookie '{cookie_name}': a "
+                            "syntax-breaking payload in the cookie value triggered "
+                            "a recognisable SQL error string in the response.",
+                            confidence="High",
+                        ))
+                        break
 
-                if (ep.path, param) in reported_params:
-                    continue  # already reported via error-based
+                if key in reported:
+                    continue
 
-                # ── Pass 2: Boolean-based blind ─────────────────────────────
-                for true_payload, false_payload in PROBE_PAIRS:
-                    true_url = _build_test_url(ep.url, param, true_payload)
-                    false_url = _build_test_url(ep.url, param, false_payload)
+                # Pass 2: boolean-based blind via cookie
+                try:
+                    b1 = await client.get(ep.url)
+                    b2 = await client.get(ep.url)
+                    cookie_baseline = (len(b1.text) + len(b2.text)) / 2
+                except httpx.HTTPError:
+                    continue
 
+                for true_p, false_p in PROBE_PAIRS:
+                    true_cookies = {**cookies, cookie_name: true_p}
+                    false_cookies = {**cookies, cookie_name: false_p}
                     try:
-                        true_resp = await client.get(true_url)
-                        false_resp = await client.get(false_url)
+                        true_resp = await client.get(ep.url, cookies=true_cookies)  # type: ignore[arg-type]
+                        false_resp = await client.get(ep.url, cookies=false_cookies)  # type: ignore[arg-type]
                     except httpx.HTTPError:
                         continue
-
-                    true_len = len(true_resp.text)
-                    false_len = len(false_resp.text)
-
-                    # true payload should look similar to the normal response.
-                    # Use a wider 10% tolerance to absorb per-request noise.
-                    true_close_to_baseline = _within(true_len, baseline_len, 0.10)
-
-                    # false payload must diverge meaningfully from true payload:
-                    # both ratio AND a minimum absolute byte floor must be met.
-                    abs_diff = abs(false_len - true_len)
-                    ratio_diverges = not _within(false_len, true_len, 0.05)
-                    diverges_from_true = ratio_diverges and abs_diff >= 5
-
-                    if true_close_to_baseline and diverges_from_true:
-                        reported_params.add((ep.path, param))
-                        findings.append(
-                            {
-                                "id": uuid.uuid4().hex[:10],
-                                "category": "sqli",
-                                "severity": "High",
-                                "type": "SQL Injection",
-                                "endpoint": ep.path,
-                                "parameter": param,
-                                "method": "GET",
-                                "url": f"{ep.url.split('?')[0]}?{param}=",
-                                "description": (
-                                    f"The '{param}' parameter is concatenated "
-                                    "directly into a SQL query. A boolean-based "
-                                    "blind injection payload altered the "
-                                    "response, confirming the backend query is "
-                                    "unsanitized."
-                                ),
-                                "evidence": (
-                                    f"{param}={true_payload} matched the "
-                                    f"baseline response ({true_len} bytes, "
-                                    f"avg baseline {baseline_len:.0f} bytes); "
-                                    f"{param}={false_payload} returned a "
-                                    f"different response ({false_len} bytes, "
-                                    f"delta {abs_diff} bytes)."
-                                ),
-                                "confidence": "Medium",
-                            }
-                        )
-                        break  # one confirmed pair is enough for this param
+                    tl, fl = len(true_resp.text), len(false_resp.text)
+                    abs_diff = abs(fl - tl)
+                    if (
+                        _within(tl, cookie_baseline, 0.10)
+                        and not _within(fl, tl, 0.05)
+                        and abs_diff >= 5
+                    ):
+                        reported.add(key)
+                        findings.append({
+                            "id": uuid.uuid4().hex[:10],
+                            "category": "sqli",
+                            "severity": "High",
+                            "type": "SQL Injection",
+                            "endpoint": ep.path,
+                            "parameter": cookie_name,
+                            "method": "COOKIE",
+                            "url": ep.url.split("?")[0],
+                            "description": (
+                                f"The '{cookie_name}' cookie value is concatenated "
+                                "directly into a SQL query. A boolean-based blind "
+                                "injection payload altered the response, confirming "
+                                "the backend query is unsanitized."
+                            ),
+                            "evidence": (
+                                f"Cookie {cookie_name}={true_p!r} matched baseline "
+                                f"({tl} bytes, avg {cookie_baseline:.0f}); "
+                                f"{cookie_name}={false_p!r} returned {fl} bytes "
+                                f"(delta {abs_diff} bytes)."
+                            ),
+                            "confidence": "Medium",
+                        })
+                        break
 
     return findings
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _get_baseline(client: httpx.AsyncClient, url: str) -> float | None:
+    try:
+        b1 = await client.get(url)
+        b2 = await client.get(url)
+        return (len(b1.text) + len(b2.text)) / 2
+    except httpx.HTTPError:
+        return None
+
+
+async def _boolean_test(
+    client: httpx.AsyncClient,
+    ep: Endpoint,
+    param: str,
+    true_payload: str,
+    false_payload: str,
+    baseline_len: float,
+    injection: str = "GET",
+) -> dict | None:
+    true_url = _build_test_url(ep.url, param, true_payload)
+    false_url = _build_test_url(ep.url, param, false_payload)
+    try:
+        true_resp = await client.get(true_url)
+        false_resp = await client.get(false_url)
+    except httpx.HTTPError:
+        return None
+    tl, fl = len(true_resp.text), len(false_resp.text)
+    abs_diff = abs(fl - tl)
+    if _within(tl, baseline_len, 0.10) and not _within(fl, tl, 0.05) and abs_diff >= 5:
+        return {
+            "id": uuid.uuid4().hex[:10],
+            "category": "sqli",
+            "severity": "High",
+            "type": "SQL Injection",
+            "endpoint": ep.path,
+            "parameter": param,
+            "method": injection,
+            "url": f"{ep.url.split('?')[0]}?{param}=",
+            "description": (
+                f"The '{param}' parameter is concatenated directly into a SQL query. "
+                "A boolean-based blind injection payload altered the response, "
+                "confirming the backend query is unsanitized."
+            ),
+            "evidence": (
+                f"{param}={true_payload} matched the baseline response "
+                f"({tl} bytes, avg baseline {baseline_len:.0f} bytes); "
+                f"{param}={false_payload} returned a different response "
+                f"({fl} bytes, delta {abs_diff} bytes)."
+            ),
+            "confidence": "Medium",
+        }
+    return None
+
+
+def _make_finding(
+    ep: Endpoint,
+    param: str,
+    method: str,
+    payload: str,
+    description: str,
+    confidence: str = "High",
+) -> dict:
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "category": "sqli",
+        "severity": "High",
+        "type": "SQL Injection",
+        "endpoint": ep.path,
+        "parameter": param,
+        "method": method,
+        "url": ep.url.split("?")[0] if method in ("COOKIE", "POST") else f"{ep.url.split('?')[0]}?{param}=",
+        "description": description,
+        "evidence": f"Payload {payload!r} via '{param}' triggered a recognisable SQL error in the response body.",
+        "confidence": confidence,
+    }
 
 
 def _within(a: int | float, b: int | float, tolerance_ratio: float) -> bool:

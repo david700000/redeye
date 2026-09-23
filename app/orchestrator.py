@@ -47,7 +47,15 @@ async def _is_reachable(target: str) -> bool:
         return False
 
 
-async def run_scan(scan_id: str, target: str, profile: str) -> None:
+async def run_scan(
+    scan_id: str,
+    target: str,
+    profile: str,
+    cookies: dict | None = None,
+    headers: dict | None = None,
+) -> None:
+    cookies = cookies or {}
+    headers = headers or {}
     started = time.monotonic()
     store.update_scan(scan_id, status="running")
 
@@ -65,7 +73,7 @@ async def run_scan(scan_id: str, target: str, profile: str) -> None:
 
         # Crawl
         await _step(scan_id, "crawl", "active")
-        endpoints = await crawl(target)
+        endpoints = await crawl(target, cookies=cookies, headers=headers)
         await log(f"Crawl complete: {len(endpoints)} endpoint(s) found")
         for ep in endpoints[:8]:
             param_str = f" [{', '.join(ep.params)}]" if ep.params else " [no params]"
@@ -106,8 +114,8 @@ async def run_scan(scan_id: str, target: str, profile: str) -> None:
 
         # Security headers
         await _step(scan_id, "headers", "active")
-        await log("Checking security response headers...")
-        header_findings = await check_headers(target)
+        await log(f"Checking security response headers...")
+        header_findings = await check_headers(target, cookies=cookies, headers=headers)
         if header_findings:
             missing = [f["type"].replace("Missing Security Header: ", "") for f in header_findings]
             await log(f"Missing headers ({len(header_findings)}): {', '.join(missing)}")
@@ -129,7 +137,7 @@ async def run_scan(scan_id: str, target: str, profile: str) -> None:
         # XSS
         await _step(scan_id, "xss", "active")
         await log(f"Testing {len(probe_eps)} parameterised endpoint(s) for XSS...")
-        xss_findings = await check_xss(endpoints)
+        xss_findings = await check_xss(endpoints, cookies=cookies, headers=headers)
         for f in xss_findings:
             await log(f"FOUND: Reflected XSS on {f['endpoint']}?{f['parameter']}=")
         if not xss_findings:
@@ -139,7 +147,7 @@ async def run_scan(scan_id: str, target: str, profile: str) -> None:
         # SQLi
         await _step(scan_id, "sqli", "active")
         await log(f"Testing {len(probe_eps)} parameterised endpoint(s) for SQL injection...")
-        sqli_findings = await check_sqli(endpoints)
+        sqli_findings = await check_sqli(endpoints, cookies=cookies, headers=headers)
         for f in sqli_findings:
             await log(f"FOUND: Boolean divergence on {f['endpoint']}?{f['parameter']}=")
         if not sqli_findings:
@@ -149,7 +157,7 @@ async def run_scan(scan_id: str, target: str, profile: str) -> None:
         # Traversal
         await _step(scan_id, "traversal", "active")
         await log("Testing path parameters for directory traversal...")
-        traversal_findings = await check_traversal(endpoints)
+        traversal_findings = await check_traversal(endpoints, cookies=cookies, headers=headers)
         for f in traversal_findings:
             await log(f"FOUND: Path traversal on {f['endpoint']}?{f['parameter']}=")
         if not traversal_findings:

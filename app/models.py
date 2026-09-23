@@ -19,6 +19,14 @@ class ScanRequest(BaseModel):
         description="Only used when profile=custom. Subset of "
         "['headers','xss','sqli','traversal'].",
     )
+    cookies: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Session cookies to include with every request (e.g. {'session': 'abc123'}).",
+    )
+    headers: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Extra HTTP headers to include with every request.",
+    )
 
 
 class ScanStatus(str, Enum):
